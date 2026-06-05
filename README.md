@@ -29,6 +29,7 @@ and a total render and stitch time of 6 minutes 24 seconds.
 - Automatic template generation for configuration files
 - Full Unicode/Chinese character support (using Noto CJK fonts)
 
+
 **Visual Assets:**
    • Photos (.jpg, .png) – Ken Burns effect (zoom + pan) applied via FFmpeg zoompan filter.
    • Video clips (.mp4, .mov, .avi) – seamlessly integrated (audio removed, replaced by background music). Videos are re‑encoded to match the output frame rate (default 24 fps) to preserve original duration.
