@@ -86,9 +86,9 @@ done
 
 if [ -z "$PROJECT" ]; then
     echo "Usage: ./stitch_master.sh <project_name> [batch_size] [--yes] [--dry-run] [--init]"
-    echo "Example: ./stitch_master.sh park_pottery --yes --dry-run"
-    echo "Example: ./stitch_master.sh park_pottery 200 --yes"
-    echo "Example: ./stitch_master.sh z_Europe --init"
+    echo "Example: ./stitch_master.sh park_pottery 200 --yes --dry-run"
+    echo "Example: ./stitch_master.sh park_pottery --yes"
+    echo "Example: ./stitch_master.sh park_pottery --init"
     echo "Example: ./stitch_master.sh z_Europe --yes"
     exit 1
 fi
