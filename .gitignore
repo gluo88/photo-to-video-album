@@ -1,0 +1,9 @@
+# Ignores all Vim/editor backup files ending in .un~
+.*.un~
+
+# Ignores the folder and everything inside it
+yaml_template/
+
+# Local release notes (kept locally, not version controlled)
+release_notes/
+CLAUDE.md
