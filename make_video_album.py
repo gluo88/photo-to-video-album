@@ -8,6 +8,7 @@ v36     use ffmpeg only: zoompan + drawtext + boxblur
 v39.11  Fixed video frame rate, Added -r {fps} to process_video to prevent duration stretching
 v39.12  Audio crossfade implementation - uses FFmpeg acrossfade filter for smooth transitions
         between looped music files. Configurable via audio.crossfade_seconds in album_config.yaml
+v39.13  Fix audio encoding crash on MP3s with embedded cover art (add -vn flag)
         Also consolidated versioned filenames: make_video_album_v39_11.py -> make_video_album.py
 
 FEATURES: Ken Burns (by ffmpeg only), title/subtitle/captions, Chinese fonts,
@@ -21,7 +22,7 @@ Note to LLM (please do not remove this note):
 
 
 """
-Cinematic Video Album Generator v39.12 – Audio Crossfade Implementation
+Cinematic Video Album Generator v39.13 – Audio Cover Art Fix
 - Added FFmpeg acrossfade filter for smooth audio transitions between looped music files
 - Configurable crossfade duration via audio.crossfade_seconds in album_config.yaml (default: 2 seconds)
 - Consolidated file naming: make_video_album.py (was make_video_album_v39_11.py)
@@ -43,8 +44,8 @@ from pathlib import Path
 
 import yaml
 
-VERSION = "39.12"
-VERSION_DATE = "2026-06-06"
+VERSION = "39.13"
+VERSION_DATE = "2026-06-07"
 ENGINE = "Pure FFmpeg (zoompan + drawtext + boxblur)"
 DEFAULT_CHUNK_SIZE = 200
 WRAP_LENGTH = 50
@@ -461,6 +462,7 @@ def build_audio_track_ffmpeg(music_files, total_duration, output_path, crossfade
     if len(loop_files) == 1:
         cmd = [
             "ffmpeg", "-i", loop_files[0],
+            "-vn",  # skip embedded cover art / video streams in audio files
             "-af", f"afade=t=in:st=0:d={crossfade},afade=t=out:st={max(0, total_duration - crossfade)}:d={crossfade}",
             "-t", str(total_duration),
             "-acodec", "aac",
