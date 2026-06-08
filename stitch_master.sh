@@ -6,6 +6,7 @@
 # v3.5 – with version and audio logging
 # v3.6 – with cumulative rendering time
 # v4.0 - merged. Combines run_video.sh and stitch_master.sh into one script.
+# v4.1 - Separated audio stitching to prevent loop resets across chunks.
 #
 # Usage: ./stitch_master.sh <project_name> [batch_size] [--yes] [--dry-run] [--init]
 # Example:
@@ -14,8 +15,8 @@
 #  To LLM：Please keep all valid comments and other information when updating!!! (please keep this line.)
 
 # current version:
-VERSION="4.0"
-VERSION_DATE="2026-06-02"
+VERSION="4.1"
+VERSION_DATE="2026-06-07"
 
 # ====================================================================
 # 1. Special case: internal logger (called by xterm)
@@ -96,12 +97,13 @@ fi
 # ====================================================================
 # 3. Paths and project directory
 # ====================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 PICTURES_DIR="/home/gluo/Pictures/$PROJECT"
 OUTPUT_DIR="$PICTURES_DIR/output"
 FINAL_OUT="$PICTURES_DIR/${PROJECT}_FINAL_MASTER.mp4"
 PERF_LOG="$PICTURES_DIR/log_perf.txt"
 RENDER_LOG="$PICTURES_DIR/log_render.txt"
-PY_SCRIPT="make_video_album.py"
+PY_SCRIPT="$SCRIPT_DIR/make_video_album.py"
 VENV_PATH="/home/gluo/code/python/venv/bin/activate"
 
 # ====================================================================
@@ -225,7 +227,7 @@ for (( i=0; i<$TOTAL_ASSETS; i+=$BATCH_SIZE )); do
 done
 
 # ====================================================================
-# 10. Final stitch
+# 10. Final stitch and Global Audio Mux
 # ====================================================================
 echo "🦞 Stitching final master video..." | tee -a "$RENDER_LOG"
 cd "$OUTPUT_DIR" || exit
@@ -235,8 +237,17 @@ for f in $(ls -v part_*.mp4 2>/dev/null); do
 done
 
 if [ -s "inputs.txt" ]; then
+    # Stitch video parts together (silent)
     ffmpeg -f concat -safe 0 -i inputs.txt -c copy "$FINAL_OUT" >> "$RENDER_LOG" 2>&1
-    echo "✅ SUCCESS: $PROJECT Final Master Created!" | tee -a "$RENDER_LOG"
+    echo "✅ SUCCESS: Video parts stitched (Silent)." | tee -a "$RENDER_LOG"
+    
+    # Run the Python script in audio-only mode on the final stitched master
+    echo "🦞 Generating continuous audio track and muxing into final master..." | tee -a "$RENDER_LOG"
+    source "$VENV_PATH"
+    python3 "$PY_SCRIPT" "$PROJECT" --add-audio "$FINAL_OUT" 2>&1 | tee -a "$RENDER_LOG"
+    deactivate
+    
+    echo "✅ SUCCESS: $PROJECT Final Master Created with Audio!" | tee -a "$RENDER_LOG"
 else
     echo "❌ ERROR: No parts found to stitch." | tee -a "$RENDER_LOG"
 fi
@@ -296,3 +307,4 @@ END {printf "codec_name=%s; duration=%s, file_size=%.2fMB\n", codecs, dur, sz}'
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║   Cinematic Batch & Stitch Engine $VERSION  ($VERSION_DATE)          ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
+

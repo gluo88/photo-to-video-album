@@ -1,7 +1,7 @@
 LLM：Please keep all valid information when updating!!! (please keep this line.)
 
 ================================================================================
-Cinematic Batch & Stitch Engine (v39.12) - Documentation
+Cinematic Batch & Stitch Engine (v40.0) - Documentation
 ================================================================================
 
 DESCRIPTION:
@@ -25,6 +25,7 @@ and a total render and stitch time of 6 minutes 24 seconds.
 - Optional photo filename overlay (bottom‑left corner, configurable)
 - Fixed video frame rate conversion – no duration stretching
 - **Audio crossfade between looped music files** – smooth transitions using FFmpeg acrossfade filter (v39.12+)
+- **Global audio muxing** – audio is now generated as one continuous track for the entire stitched master, eliminating loop resets at chunk boundaries (v40.0+)
 - Full logging: log_render.txt (render output) and log_perf.txt (performance)
 - Xterm dashboard showing CPU temperature and encoding speed
 - Automatic template generation for configuration files
@@ -39,6 +40,8 @@ and a total render and stitch time of 6 minutes 24 seconds.
    • Multiple background music files (.mp3) – automatically looped to match video duration.
    • Audio crossfades smoothly between files using FFmpeg's acrossfade filter (v39.12+).
    • Crossfade duration configurable via `audio.crossfade_seconds` in album_config.yaml (default: 2 seconds).
+   • Audio is now muxed into the final stitched master (not per-chunk) so music loops and crossfades are seamless across the entire album (v40.0+).
+   • The render log prints a timestamped audio timeline showing which track starts at which point (MM:SS.ss).
    • Audio is re‑encoded to AAC for universal compatibility.
 
 **Text Captions (YAML based):**
@@ -78,7 +81,7 @@ and a total render and stitch time of 6 minutes 24 seconds.
 ├── background_music_2.mp3
 └── background_music_3.mp3
 
-**Processing Flow (v39.12):**
+**Processing Flow (v40.0):**
 1. Scan project directory for all .jpg, .png, .mp4, .mov, .avi.
 2. Load album_config.yaml (create default with comments if missing). The default config includes `section_style` and `caption_style` with Chinese‑capable font path.
 3. For each asset:
@@ -89,10 +92,9 @@ and a total render and stitch time of 6 minutes 24 seconds.
         - Else: scale, pad, apply zoompan (Ken Burns).
    d. Process video: scale, pad, remove original audio, force output frame rate (`-r`), encode to H.264.
    e. Overlay section text (using `section_style`) and caption text (using `caption_style`), and optionally photo filename (bottom‑left, small gray/white).
-4. Concatenate all segments into a part_*.mp4 file.
-5. Build background audio track: loop MP3 files as needed with smooth crossfades between files (v39.12+), re‑encode to AAC.
-6. Mux audio with video, add faststart flag.
-7. The bash wrapper (stitch_master.sh) repeats this for each chunk and stitches final master.
+4. Concatenate all segments into a part_*.mp4 file (silent – no audio track).
+5. The bash wrapper (stitch_master.sh) repeats steps 1–4 for each chunk, then stitches all silent parts into the final master.
+6. After stitching, build one continuous background audio track for the full video duration (looping MP3 files with smooth crossfades, v40.0+), mux into the final master, add faststart flag.
 
 1. INPUTS:
    -- Visual Assets: Photos (.jpg, .png) and videos (.mp4, .mov, .avi).

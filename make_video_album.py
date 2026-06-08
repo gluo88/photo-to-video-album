@@ -7,9 +7,9 @@ v36     use ffmpeg only: zoompan + drawtext + boxblur
         Processed 1480 photos (200 per chunk) in about one hour
 v39.11  Fixed video frame rate, Added -r {fps} to process_video to prevent duration stretching
 v39.12  Audio crossfade implementation - uses FFmpeg acrossfade filter for smooth transitions
-        between looped music files. Configurable via audio.crossfade_seconds in album_config.yaml
 v39.13  Fix audio encoding crash on MP3s with embedded cover art (add -vn flag)
-        Also consolidated versioned filenames: make_video_album_v39_11.py -> make_video_album.py
+v40.0   Separated Audio Muxing from Chunking. Audio now generated as one continuous loop 
+        for the entire stitched master. Prints precise timeline timestamps for tracks.
 
 FEATURES: Ken Burns (by ffmpeg only), title/subtitle/captions, Chinese fonts,
         photo filename overlay option (2.5× slower when enabled),
@@ -22,12 +22,10 @@ Note to LLM (please do not remove this note):
 
 
 """
-Cinematic Video Album Generator v39.13 – Audio Cover Art Fix
-- Added FFmpeg acrossfade filter for smooth audio transitions between looped music files
-- Configurable crossfade duration via audio.crossfade_seconds in album_config.yaml (default: 2 seconds)
-- Consolidated file naming: make_video_album.py (was make_video_album_v39_11.py)
-- Fade-in at start, fade-out at end of final audio track
-- Gracefully handles short audio files by skipping crossfade and using concat instead
+Cinematic Video Album Generator v40.0 – Global Audio Muxing
+- Chunks are now processed as silent video streams.
+- Added --add-audio mode to generate one continuous track for the final stitched master.
+- Implemented precise timeline timestamps for printed audio track logs.
 """
 
 import os
@@ -44,7 +42,7 @@ from pathlib import Path
 
 import yaml
 
-VERSION = "39.13"
+VERSION = "40.0"
 VERSION_DATE = "2026-06-07"
 ENGINE = "Pure FFmpeg (zoompan + drawtext + boxblur)"
 DEFAULT_CHUNK_SIZE = 200
@@ -446,18 +444,34 @@ def add_text_overlays(video_path, section_text, caption_text, resolution,
 def build_audio_track_ffmpeg(music_files, total_duration, output_path, crossfade=2):
     if not music_files:
         return None
-    total_dur = 0
+        
     loop_files = []
     file_durations = []
-    for f in itertools.cycle(music_files):
-        if total_dur >= total_duration:
-            break
-        loop_files.append(f)
-        dur = get_media_duration(f)
-        file_durations.append(dur)
-        total_dur += dur
+    current_timeline_dur = 0.0
 
-    log(f"   Building audio track with {len(loop_files)} files, crossfade: {crossfade}s")
+    log(f"   Building continuous audio track (Target: {total_duration:.1f}s, Crossfade: {crossfade}s)")
+    log("   === Audio Timeline ===")
+    
+    for f in itertools.cycle(music_files):
+        if current_timeline_dur >= total_duration:
+            break
+            
+        dur = get_media_duration(f)
+        loop_files.append(f)
+        file_durations.append(dur)
+        
+        # Print timeline stamp
+        mins = int(current_timeline_dur // 60)
+        secs = current_timeline_dur % 60
+        log(f"      ▶ Starts at {mins:02d}:{secs:05.2f} | {os.path.basename(f)}")
+        
+        # Calculate start time for the next track in the loop
+        if dur >= crossfade:
+            current_timeline_dur += (dur - crossfade)
+        else:
+            current_timeline_dur += dur
+
+    log("   ======================")
 
     if len(loop_files) == 1:
         cmd = [
@@ -516,21 +530,24 @@ def main():
     if init_mode:
         sys.argv.remove("--init")
 
+    add_audio_mode = "--add-audio" in sys.argv
+    audio_target_video = None
+    if add_audio_mode:
+        pos = sys.argv.index("--add-audio")
+        if pos + 1 >= len(sys.argv):
+            print("❌ --add-audio requires a video file path argument")
+            sys.exit(1)
+        audio_target_video = sys.argv[pos+1]
+        sys.argv.pop(pos)  # remove flag
+        sys.argv.pop(pos)  # remove path
+
     print_version()
     
     if len(sys.argv) < 2:
-        print("Usage: make_video_album_v39_11.py <project_name> [start] [end] [--chunk-size N] [--init]")
+        print("Usage: make_video_album.py <project_name> [start] [end] [--chunk-size N] [--init] [--add-audio <video>]")
         sys.exit(1)
 
-    start_time = time.time()
     project_name = sys.argv[1]
-    start_idx = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-    end_idx = int(sys.argv[3]) if len(sys.argv) > 3 else 999999
-    chunk_size = DEFAULT_CHUNK_SIZE
-    if "--chunk-size" in sys.argv:
-        pos = sys.argv.index("--chunk-size")
-        chunk_size = int(sys.argv[pos+1])
-
     project_dir = os.path.join("/home/gluo/Pictures", project_name)
     if not os.path.isdir(project_dir):
         print(f"❌ Project directory {project_dir} not found")
@@ -543,6 +560,61 @@ def main():
 
     log("Loading album config...")
     album_cfg = load_album_config(project_dir, init_mode=init_mode)
+
+    # ----------------------------------------------------------------
+    # AUDIO MUXING MODE (Run once at the very end by stitch_master.sh)
+    # ----------------------------------------------------------------
+    if add_audio_mode:
+        log("--- GLOBAL AUDIO MUXING MODE ---")
+        music_files = sorted(glob.glob(os.path.join(project_dir, "*.mp3")))
+        if album_cfg["audio"]["default_list"]:
+            music_files = [os.path.join(project_dir, os.path.basename(f)) for f in album_cfg["audio"]["default_list"]]
+        
+        if not music_files:
+            log("No music files found in project. Skipping audio.")
+            sys.exit(0)
+            
+        temp_dir = f"/tmp/{project_name}_audio"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        if not os.path.isfile(audio_target_video):
+            log(f"❌ Video file not found: {audio_target_video}")
+            sys.exit(1)
+
+        total_dur = get_media_duration(audio_target_video)
+        
+        audio_path = os.path.join(temp_dir, "full_audio.m4a")
+        build_audio_track_ffmpeg(
+            music_files, total_dur, audio_path,
+            crossfade=album_cfg["audio"].get("crossfade_seconds", 2)
+        )
+        
+        base, ext = os.path.splitext(audio_target_video)
+        final_video = f"{base}_temp_audio{ext}"
+        audio_codec = album_cfg["output"].get("audio_codec", "aac_low")
+        cmd_mux = [
+            "ffmpeg", "-i", audio_target_video, "-i", audio_path,
+            "-c:v", "copy", "-c:a", audio_codec,
+            "-movflags", "+faststart", "-shortest", "-y", final_video
+        ]
+        run_ffmpeg(cmd_mux, "muxing audio to master video")
+        
+        os.replace(final_video, audio_target_video)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        log(f"✅ Audio successfully added to {os.path.basename(audio_target_video)}")
+        sys.exit(0)
+
+
+    # ----------------------------------------------------------------
+    # STANDARD CHUNK PROCESSING MODE
+    # ----------------------------------------------------------------
+    start_time = time.time()
+    start_idx = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    end_idx = int(sys.argv[3]) if len(sys.argv) > 3 else 999999
+    chunk_size = DEFAULT_CHUNK_SIZE
+    if "--chunk-size" in sys.argv:
+        pos = sys.argv.index("--chunk-size")
+        chunk_size = int(sys.argv[pos+1])
 
     log("Discovering assets...")
     raw_files = []
@@ -664,6 +736,7 @@ def main():
     with open(concat_list, "w") as f:
         for seg in segment_files:
             f.write(f"file '{seg}'\n")
+    
     part_output = os.path.join(project_dir, f"part_{start_idx:04d}_{end_idx:04d}.mp4")
     cmd_concat = [
         "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_list,
@@ -671,33 +744,9 @@ def main():
     ]
     run_ffmpeg(cmd_concat, "concatenating segments")
     
-    music_files = sorted(glob.glob(os.path.join(project_dir, "*.mp3")))
-    if album_cfg["audio"]["default_list"]:
-        music_files = album_cfg["audio"]["default_list"]
-    if music_files:
-        log("Adding background music...")
-        log(f"   Audio files ({len(music_files)} total):")
-        for mf in music_files:
-            log(f"      - {os.path.basename(mf)}")
-        total_dur = get_media_duration(part_output)
-        log(f"   Video duration: {total_dur:.1f} seconds")
-        audio_path = os.path.join(temp_dir, "full_audio.m4a")
-        build_audio_track_ffmpeg(
-            music_files, total_dur, audio_path,
-            crossfade=album_cfg["audio"].get("crossfade_seconds", 2)
-        )
-        final_video = part_output.replace(".mp4", "_temp.mp4")
-        cmd_mux = [
-            "ffmpeg", "-i", part_output, "-i", audio_path,
-            "-c:v", "copy", "-c:a", album_cfg["output"]["audio_codec"],
-            "-movflags", "+faststart", "-shortest", "-y", final_video
-        ]
-        run_ffmpeg(cmd_mux, "muxing audio")
-        os.replace(final_video, part_output)
-    
     shutil.rmtree(temp_dir, ignore_errors=True)
     elapsed = time.time() - start_time
-    log(f"✅ Done: {part_output}")
+    log(f"✅ Done: {part_output} (Silent Video Chunk)")
     log(f"⏱️ Total processing time: {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
 
 if __name__ == "__main__":
