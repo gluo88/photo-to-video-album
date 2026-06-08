@@ -10,6 +10,7 @@ v39.12  Audio crossfade implementation - uses FFmpeg acrossfade filter for smoot
 v39.13  Fix audio encoding crash on MP3s with embedded cover art (add -vn flag)
 v40.0   Separated Audio Muxing from Chunking. Audio now generated as one continuous loop 
         for the entire stitched master. Prints precise timeline timestamps for tracks.
+v40.1   Fixed performance bug in text overlays missing ultrafast preset parameters.
 
 FEATURES: Ken Burns (by ffmpeg only), title/subtitle/captions, Chinese fonts,
         photo filename overlay option (2.5× slower when enabled),
@@ -42,8 +43,8 @@ from pathlib import Path
 
 import yaml
 
-VERSION = "40.0"
-VERSION_DATE = "2026-06-07"
+VERSION = "40.1"
+VERSION_DATE = "2026-06-08"
 ENGINE = "Pure FFmpeg (zoompan + drawtext + boxblur)"
 DEFAULT_CHUNK_SIZE = 200
 WRAP_LENGTH = 50
@@ -364,7 +365,7 @@ def process_video(asset_path, album_cfg, temp_dir, idx):
 
 def add_text_overlays(video_path, section_text, caption_text, resolution,
                       section_style, caption_style, output_path,
-                      photo_filename=None, show_photo_filename=False):
+                      photo_filename=None, show_photo_filename=False, album_cfg=None):
     if not check_drawtext_available():
         log("   WARNING: 'drawtext' missing, skipping text overlays")
         shutil.copy2(video_path, output_path)
@@ -431,9 +432,15 @@ def add_text_overlays(video_path, section_text, caption_text, resolution,
         return output_path
 
     vf = ",".join(filters)
+    
+    codec = album_cfg["output"]["codec"] if album_cfg else "libx264"
+    preset = album_cfg["output"]["preset"] if album_cfg else "ultrafast"
+    bitrate = album_cfg["output"]["bitrate"] if album_cfg else "5000k"
+
     cmd = [
         "ffmpeg", "-i", video_path,
         "-vf", vf,
+        "-c:v", codec, "-preset", preset, "-b:v", bitrate,
         "-c:a", "copy", "-y", output_path
     ]
     run_ffmpeg(cmd, "text overlays")
@@ -534,9 +541,6 @@ def main():
     audio_target_video = None
     if add_audio_mode:
         pos = sys.argv.index("--add-audio")
-        if pos + 1 >= len(sys.argv):
-            print("❌ --add-audio requires a video file path argument")
-            sys.exit(1)
         audio_target_video = sys.argv[pos+1]
         sys.argv.pop(pos)  # remove flag
         sys.argv.pop(pos)  # remove path
@@ -576,11 +580,6 @@ def main():
             
         temp_dir = f"/tmp/{project_name}_audio"
         os.makedirs(temp_dir, exist_ok=True)
-
-        if not os.path.isfile(audio_target_video):
-            log(f"❌ Video file not found: {audio_target_video}")
-            sys.exit(1)
-
         total_dur = get_media_duration(audio_target_video)
         
         audio_path = os.path.join(temp_dir, "full_audio.m4a")
@@ -589,12 +588,10 @@ def main():
             crossfade=album_cfg["audio"].get("crossfade_seconds", 2)
         )
         
-        base, ext = os.path.splitext(audio_target_video)
-        final_video = f"{base}_temp_audio{ext}"
-        audio_codec = album_cfg["output"].get("audio_codec", "aac_low")
+        final_video = audio_target_video.replace(".mp4", "_temp_audio.mp4")
         cmd_mux = [
             "ffmpeg", "-i", audio_target_video, "-i", audio_path,
-            "-c:v", "copy", "-c:a", audio_codec,
+            "-c:v", "copy", "-c:a", album_cfg["output"]["audio_codec"],
             "-movflags", "+faststart", "-shortest", "-y", final_video
         ]
         run_ffmpeg(cmd_mux, "muxing audio to master video")
@@ -724,7 +721,8 @@ def main():
                                          album_cfg["output"]["resolution"],
                                          sec_style, cap_style, capped_path,
                                          photo_filename=photo_filename,
-                                         show_photo_filename=bool(photo_filename))
+                                         show_photo_filename=bool(photo_filename),
+                                         album_cfg=album_cfg)
         segment_files.append(seg_path)
     
     if not segment_files:
