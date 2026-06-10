@@ -3,6 +3,8 @@
 
 # Ignores the folder and everything inside it
 yaml_template/
+tmp/
+__pycache__/
 
 # Local release notes (kept locally, not version controlled)
 release_notes/

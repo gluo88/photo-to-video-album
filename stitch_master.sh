@@ -7,16 +7,17 @@
 # v3.6 – with cumulative rendering time
 # v4.0 - merged. Combines run_video.sh and stitch_master.sh into one script.
 # v4.1 - Separated audio stitching to prevent loop resets across chunks.
+# v4.2 - Removed --yes flag / confirmation prompt. Defaults to auto-continue.
 #
-# Usage: ./stitch_master.sh <project_name> [batch_size] [--yes] [--dry-run] [--init]
+# Usage: ./stitch_master.sh <project_name> [batch_size] [--dry-run] [--init]
 # Example:
-#        ./stitch_master.sh  z_SanXingDuiMuseumX 200 --yes --dry-run
+#        ./stitch_master.sh  z_SanXingDuiMuseumX 200 --dry-run
 #
 #  To LLM：Please keep all valid comments and other information when updating!!! (please keep this line.)
 
 # current version:
-VERSION="4.1"
-VERSION_DATE="2026-06-07"
+VERSION="4.2"
+VERSION_DATE="2026-06-09"
 
 # ====================================================================
 # 1. Special case: internal logger (called by xterm)
@@ -48,7 +49,6 @@ fi
 # ====================================================================
 PROJECT=""
 BATCH_SIZE=200          # default (matches Python default)
-YES_FLAG=""
 DRY_RUN=""
 INIT_FLAG=""
 
@@ -57,10 +57,6 @@ while [[ $# -gt 0 ]]; do
         --chunk-size)   # legacy alias for batch_size
             BATCH_SIZE="$2"
             shift 2
-            ;;
-        --yes)
-            YES_FLAG="--yes"
-            shift
             ;;
         --dry-run)
             DRY_RUN="--dry-run"
@@ -86,11 +82,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$PROJECT" ]; then
-    echo "Usage: ./stitch_master.sh <project_name> [batch_size] [--yes] [--dry-run] [--init]"
-    echo "Example: ./stitch_master.sh park_pottery 200 --yes --dry-run"
-    echo "Example: ./stitch_master.sh park_pottery --yes"
+    echo "Usage: ./stitch_master.sh <project_name> [batch_size] [--dry-run] [--init]"
+    echo "Example: ./stitch_master.sh park_pottery 200 --dry-run"
     echo "Example: ./stitch_master.sh park_pottery --init"
-    echo "Example: ./stitch_master.sh z_Europe --yes"
+    echo "Example: ./stitch_master.sh z_Europe"
     exit 1
 fi
 
@@ -186,20 +181,12 @@ if [ -n "$INIT_FLAG" ]; then
 fi
 
 # ====================================================================
-# 8. Pre-flight confirmation (unless --yes)
+# 8. Project summary (informational only, auto-continue)
 # ====================================================================
-if [ -z "$YES_FLAG" ]; then
-    MP3_COUNT=$(find "$PICTURES_DIR" -maxdepth 1 -iname "*.mp3" | wc -l)
-    echo "Project: $PROJECT" | tee -a "$RENDER_LOG"
-    echo "Assets: $TOTAL_ASSETS (photos+videos)" | tee -a "$RENDER_LOG"
-    echo "Music files: $MP3_COUNT" | tee -a "$RENDER_LOG"
-    read -p "Continue? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        kill $LOGGER_PID 2>/dev/null
-        exit 0
-    fi
-fi
+MP3_COUNT=$(find "$PICTURES_DIR" -maxdepth 1 -iname "*.mp3" | wc -l)
+echo "Project: $PROJECT" | tee -a "$RENDER_LOG"
+echo "Assets: $TOTAL_ASSETS (photos+videos)" | tee -a "$RENDER_LOG"
+echo "Music files: $MP3_COUNT" | tee -a "$RENDER_LOG"
 
 if [ -n "$DRY_RUN" ]; then
     echo "Dry run – exiting." | tee -a "$RENDER_LOG"
