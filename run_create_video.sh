@@ -5,19 +5,22 @@
 # v3.4 – New log naming: log_perf.txt and log_render.txt
 # v3.5 – with version and audio logging
 # v3.6 – with cumulative rendering time
-# v4.0 - merged. Combines run_video.sh and stitch_master.sh into one script.
+# v4.0 - merged. Combines run_video.sh and run_create_video.sh into one script.
 # v4.1 - Separated audio stitching to prevent loop resets across chunks.
 # v4.2 - Removed --yes flag / confirmation prompt. Defaults to auto-continue.
+# v4.3 - Added --clear-config and --migrate flags (delegates to make_video_album.py v42.0)
+# v4.4 - Renamed stitch_master.sh → run_create_video.sh (2026-06-10)
+# v4.5 - Added --location-only flag, updated help text for non-rendering modes
 #
-# Usage: ./stitch_master.sh <project_name> [batch_size] [--dry-run] [--init]
+# Usage: ./run_create_video.sh <project_name> [batch_size] [--dry-run] [--init] [--migrate] [--clear-config] [--location-only]
 # Example:
-#        ./stitch_master.sh  z_SanXingDuiMuseumX 200 --dry-run
+#        ./run_create_video.sh  z_SanXingDuiMuseumX 200 --dry-run
 #
 #  To LLM：Please keep all valid comments and other information when updating!!! (please keep this line.)
 
 # current version:
-VERSION="4.2"
-VERSION_DATE="2026-06-09"
+VERSION="4.5"
+VERSION_DATE="2026-06-10"
 
 # ====================================================================
 # 1. Special case: internal logger (called by xterm)
@@ -51,6 +54,9 @@ PROJECT=""
 BATCH_SIZE=200          # default (matches Python default)
 DRY_RUN=""
 INIT_FLAG=""
+MIGRATE_FLAG=""
+CLEAR_CONFIG_FLAG=""
+LOCATION_ONLY_FLAG=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -65,6 +71,37 @@ while [[ $# -gt 0 ]]; do
         --init)
             INIT_FLAG="--init"
             shift
+            ;;
+        --migrate)
+            MIGRATE_FLAG="--migrate"
+            shift
+            ;;
+        --clear-config)
+            CLEAR_CONFIG_FLAG="--clear-config"
+            shift
+            ;;
+        --location-only)
+            LOCATION_ONLY_FLAG="--location-only"
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: ./run_create_video.sh <project_name> [batch_size] [options]"
+            echo ""
+            echo "Options:"
+            echo "  --dry-run        Asset discovery only, no rendering"
+            echo "  --init           Generate config files (album_config.yaml + geo_timeline.yaml)"
+            echo "  --migrate        Migrate legacy per-asset .yaml files into geo_timeline.yaml (no rendering)"
+            echo "  --clear-config   Clean geo_timeline.yaml (remove stale, clear locations, remove legacy)"
+            echo "  --location-only  Query server to fill all empty location fields, then exit (no rendering)"
+            echo "  --chunk-size N   Assets per chunk (default: 200)"
+            echo ""
+            echo "Examples:"
+            echo "  ./run_create_video.sh park_pottery --init"
+            echo "  ./run_create_video.sh park_pottery --migrate"
+            echo "  ./run_create_video.sh park_pottery --clear-config"
+            echo "  ./run_create_video.sh park_pottery --location-only"
+            echo "  ./run_create_video.sh z_Europe 200"
+            exit 0
             ;;
         -*)
             echo "Unknown option: $1"
@@ -82,10 +119,22 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$PROJECT" ]; then
-    echo "Usage: ./stitch_master.sh <project_name> [batch_size] [--dry-run] [--init]"
-    echo "Example: ./stitch_master.sh park_pottery 200 --dry-run"
-    echo "Example: ./stitch_master.sh park_pottery --init"
-    echo "Example: ./stitch_master.sh z_Europe"
+    echo "Usage: ./run_create_video.sh <project_name> [batch_size] [options]"
+    echo ""
+    echo "Options:"
+    echo "  --dry-run        Asset discovery only, no rendering"
+    echo "  --init           Generate config files (album_config.yaml + geo_timeline.yaml)"
+    echo "  --migrate        Migrate legacy per-asset .yaml files into geo_timeline.yaml (no rendering)"
+    echo "  --clear-config   Clean geo_timeline.yaml (remove stale, clear locations, remove legacy)"
+    echo "  --location-only  Query server to fill all empty location fields, then exit (no rendering)"
+    echo "  --chunk-size N   Assets per chunk (default: 200)"
+    echo ""
+    echo "Examples:"
+    echo "  ./run_create_video.sh park_pottery --init"
+    echo "  ./run_create_video.sh park_pottery --migrate"
+    echo "  ./run_create_video.sh park_pottery --clear-config"
+    echo "  ./run_create_video.sh park_pottery --location-only"
+    echo "  ./run_create_video.sh z_Europe 200"
     exit 1
 fi
 
@@ -126,9 +175,9 @@ rm -f "$RENDER_LOG" "$PERF_LOG"
 touch "$RENDER_LOG" "$PERF_LOG"
 
 # ====================================================================
-# 5. Launch xterm dashboard (unless --dry-run or --init)
+# 5. Launch xterm dashboard (unless --dry-run, --init, --migrate, or --clear-config)
 # ====================================================================
-if [ -z "$DRY_RUN" ] && [ -z "$INIT_FLAG" ]; then
+if [ -z "$DRY_RUN" ] && [ -z "$INIT_FLAG" ] && [ -z "$MIGRATE_FLAG" ] && [ -z "$CLEAR_CONFIG_FLAG" ] && [ -z "$LOCATION_ONLY_FLAG" ]; then
     if command -v xterm &>/dev/null; then
         xterm -T "RENDER MONITOR: $PROJECT" -geometry 60x10 -e bash "$0" --logger-internal "$PICTURES_DIR" &
         LOGGER_PID=$!
@@ -170,13 +219,52 @@ echo "🦞 Found $TOTAL_ASSETS genuine assets." | tee -a "$RENDER_LOG"
 # ====================================================================
 if [ -n "$INIT_FLAG" ]; then
     echo "🦞 --init mode: generating configuration files only." | tee -a "$RENDER_LOG"
-    # Call Python script with --init (it will create album_config.yaml and per‑asset template)
+    # Call Python script with --init (creates album_config.yaml + geo_timeline.yaml)
     source "$VENV_PATH"
     python3 "$PY_SCRIPT" "$PROJECT" 0 999999 --init 2>&1 | tee -a "$RENDER_LOG"
     deactivate
     # Kill logger if running
     kill $LOGGER_PID 2>/dev/null
     echo "Initialisation complete." | tee -a "$RENDER_LOG"
+    exit 0
+fi
+
+# ====================================================================
+# 7b. Handle --migrate: migrate per-asset yamls to geo_timeline.yaml
+# ====================================================================
+if [ -n "$MIGRATE_FLAG" ]; then
+    echo "🦞 --migrate mode: migrating legacy per-asset configs to geo_timeline.yaml." | tee -a "$RENDER_LOG"
+    source "$VENV_PATH"
+    python3 "$PY_SCRIPT" "$PROJECT" --migrate 2>&1 | tee -a "$RENDER_LOG"
+    deactivate
+    kill $LOGGER_PID 2>/dev/null
+    echo "Migration complete. Run --clear-config to remove legacy .yaml files." | tee -a "$RENDER_LOG"
+    exit 0
+fi
+
+# ====================================================================
+# 7c. Handle --clear-config: clean geo_timeline.yaml
+# ====================================================================
+if [ -n "$CLEAR_CONFIG_FLAG" ]; then
+    echo "🦞 --clear-config mode: cleaning geo_timeline.yaml." | tee -a "$RENDER_LOG"
+    source "$VENV_PATH"
+    python3 "$PY_SCRIPT" "$PROJECT" --clear-config 2>&1 | tee -a "$RENDER_LOG"
+    deactivate
+    kill $LOGGER_PID 2>/dev/null
+    echo "Configuration cleaned." | tee -a "$RENDER_LOG"
+    exit 0
+fi
+
+# ====================================================================
+# 7d. Handle --location-only: resolve location fields only
+# ====================================================================
+if [ -n "$LOCATION_ONLY_FLAG" ]; then
+    echo "🦞 --location-only mode: resolving location fields from GPS data." | tee -a "$RENDER_LOG"
+    source "$VENV_PATH"
+    python3 "$PY_SCRIPT" "$PROJECT" --location-only 2>&1 | tee -a "$RENDER_LOG"
+    deactivate
+    kill $LOGGER_PID 2>/dev/null
+    echo "Location resolution complete." | tee -a "$RENDER_LOG"
     exit 0
 fi
 
@@ -294,4 +382,3 @@ END {printf "codec_name=%s; duration=%s, file_size=%.2fMB\n", codecs, dur, sz}'
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║   Cinematic Batch & Stitch Engine $VERSION  ($VERSION_DATE)          ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
-

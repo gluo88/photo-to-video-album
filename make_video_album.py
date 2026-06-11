@@ -14,11 +14,26 @@ v41.5   Reverted FFmpeg filter chains for process_video and process_photo exactl
         to eliminate green screen artifacts.
 v41.6   Fixed HDR video green screen by explicitly declaring SDR color space output 
         (-color_range 1 -colorspace bt709 -color_primaries bt709 -color_trc bt709) based on user testing.
+v42.1   2026-06-10  Added --location-only mode (resolve all location fields via Nominatim
+                    + nearby-cache heuristic, no rendering).
+                    Added location_reuse_distance to album_config.yaml (default 15m).
+                    When resolving a location, nearby assets with cached locations
+                    are checked first via Haversine distance before calling Nominatim.
+                    Help text now clarifies which modes skip MP4 rendering.
+
+v42.0   2026-06-10  Merged per-asset .yaml configs into geo_timeline.yaml.
+        All per-asset settings (text, section, style, kenburns) now live in geo_timeline.yaml.
+        --init now generates a field template comment header + first-photo example in geo_timeline.yaml.
+        Added --clear-config: removes stale entries, clears location fields (keeps location_correction).
+        Added --migrate: one-shot migration of per-asset .yaml files into geo_timeline.yaml.
+        Removed per-asset .yaml creation and reading. Removed .caption file support.
+        Ken Burns per-asset overrides now read from geo_timeline.yaml.
+        Companion script renamed: stitch_master.sh → run_create_video.sh (v4.4).
 
 FEATURES: Ken Burns (by ffmpeg only), captions, Chinese fonts,
         photo filename overlay, exclusive location overlay,
         audio crossfade between looped music files,
-        global geo_timeline.yaml tracking.
+        unified geo_timeline.yaml tracking and per-asset config.
 """
 
 import os
@@ -37,14 +52,50 @@ from pathlib import Path
 import yaml
 from PIL import Image, ExifTags
 
+# ---------------------------------------------------------------------------
+# Haversine distance for GPS-based location reuse
+# ---------------------------------------------------------------------------
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Distance in meters between two GPS coordinates (Haversine formula)."""
+    import math
+    R = 6371000  # Earth radius (meters)
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def find_nearby_location(geo_timeline, lat, lon, max_distance, exclude_filename=None):
+    """Return a cached location string from the nearest asset within max_distance meters.
+    Returns None if no cached location is found within range."""
+    best_distance = max_distance + 1
+    best_location = None
+    for fn, t_data in geo_timeline.items():
+        if fn == exclude_filename:
+            continue
+        cached_loc = t_data.get("location") if isinstance(t_data, dict) else None
+        cached_gps = t_data.get("gps") if isinstance(t_data, dict) else None
+        if not cached_loc or not cached_gps:
+            continue
+        try:
+            d = haversine_distance(lat, lon, cached_gps[0], cached_gps[1])
+        except (TypeError, IndexError):
+            continue
+        if d <= max_distance and d < best_distance:
+            best_distance = d
+            best_location = cached_loc
+    return best_location
+
 try:
     from geopy.geocoders import Nominatim
     from geopy.exc import GeocoderTimedOut
 except ImportError:
     Nominatim = None
 
-VERSION = "41.6"
-VERSION_DATE = "2026-06-09"
+VERSION = "42.2"
+VERSION_DATE = "2026-06-10"
 ENGINE = "Pure FFmpeg (zoompan + drawtext + boxblur)"
 DEFAULT_CHUNK_SIZE = 200
 WRAP_LENGTH = 50
@@ -64,18 +115,21 @@ DEFAULT_CAPTION_STYLE = {
     "font": None
 }
 
+
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
 
 def print_version():
     print(f"╔══════════════════════════════════════════════════════════════╗")
     print(f"║   Cinematic Video Album Generator v{VERSION} ({ENGINE})   ║")
-    print(f"║   Date: {VERSION_DATE}                                          ║")
+    print(f"║   Date: {VERSION_DATE}                                         ║")
     print(f"║   Logs: log_render.txt (render log)                           ║")
     print(f"║         log_perf.txt (performance)                            ║")
     print(f"║   Chunk size: {DEFAULT_CHUNK_SIZE} assets                     ║")
     print(f"╚══════════════════════════════════════════════════════════════╝")
     log(f"Starting render engine v{VERSION}")
+
 
 def wrap_text(text, width=WRAP_LENGTH):
     if not text:
@@ -89,6 +143,7 @@ def wrap_text(text, width=WRAP_LENGTH):
             wrapped.append('')
     return '\n'.join(wrapped)
 
+
 def run_ffmpeg(cmd, description="ffmpeg"):
     log(f"   Running {description}...")
     log(f"   [DEBUG CMD] {' '.join(cmd)}")
@@ -98,6 +153,7 @@ def run_ffmpeg(cmd, description="ffmpeg"):
         log(f"   [!] FFmpeg error: {e.stderr}")
         raise
 
+
 def get_media_duration(filepath):
     cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -106,17 +162,21 @@ def get_media_duration(filepath):
     result = subprocess.run(cmd, capture_output=True, text=True)
     return float(result.stdout.strip())
 
+
 def resolve_portable_font():
-    for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    for p in ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
               "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
               "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"]:
         if os.path.exists(p):
             return p
     return None
 
+
 def check_drawtext_available():
     result = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True)
     return "drawtext" in result.stdout
+
 
 # ====================================================================
 # GEO & TIMELINE FUNCTIONS
@@ -126,8 +186,11 @@ def smart_delay():
     global last_nominatim_time
     elapsed = time.time() - last_nominatim_time
     if elapsed < 1.1:
-        time.sleep(1.1 - elapsed)
+        wait = 1.1 - elapsed
+        log(f"   ⏳ Nominatim rate-limit: sleeping {wait:.1f}s (last call {elapsed:.1f}s ago)")
+        time.sleep(wait)
     last_nominatim_time = time.time()
+
 
 def get_exif_data(image_path):
     try:
@@ -149,6 +212,7 @@ def get_exif_data(image_path):
     except Exception:
         return None
 
+
 def get_decimal_coordinates(info):
     for key in ['GPSLatitude', 'GPSLongitude', 'GPSLatitudeRef', 'GPSLongitudeRef']:
         if key not in info: return None
@@ -163,6 +227,7 @@ def get_decimal_coordinates(info):
         return lat, lon
     except Exception:
         return None
+
 
 def get_location_nominatim(lat, lon):
     if not Nominatim:
@@ -204,6 +269,7 @@ def get_location_nominatim(lat, lon):
             time.sleep(2)
     return None
 
+
 def load_album_config(project_dir, init_mode=False):
     config_path = os.path.join(project_dir, "album_config.yaml")
     defaults = {
@@ -227,6 +293,7 @@ def load_album_config(project_dir, init_mode=False):
             "position": "top"
         },
         "audio": {"default_list": [], "loop": True, "crossfade_seconds": 2},
+        "geo": {"location_reuse_distance": 15.0},
         "output": {
             "resolution": [1920, 1080],
             "fps": 24,
@@ -269,40 +336,17 @@ def load_album_config(project_dir, init_mode=False):
         defaults["defaults"]["show_photo_filenames"] = False
     return defaults
 
-def load_asset_config(asset_path):
-    yaml_path = os.path.splitext(asset_path)[0] + ".yaml"
-    if os.path.exists(yaml_path):
-        with open(yaml_path, 'r') as f:
-            return yaml.safe_load(f)
-    cap_path = os.path.splitext(asset_path)[0] + ".caption"
-    if os.path.exists(cap_path):
-        with open(cap_path, 'r', encoding='utf-8') as f:
-            text = f.read().strip()
-            return {"text": text} if text else None
-    return None
 
-def create_default_asset_config(asset_path, project_dir):
-    yaml_path = os.path.splitext(asset_path)[0] + ".yaml"
-    if os.path.exists(yaml_path):
-        return False
-    template = f"""# Per-asset configuration for: {os.path.basename(asset_path)}
-# text: Caption to display over the asset (remove line if no caption)
-# section: Title/Subtitle overlay for chapters
-text: "Replace with your caption"
-"""
-    with open(yaml_path, 'w') as f:
-        f.write(template)
-    log(f"   Created template asset config: {os.path.basename(yaml_path)}")
-    return True
-
-def get_asset_duration(asset_path, album_cfg, asset_config):
+def get_asset_duration(asset_path, album_cfg, t_data=None):
+    """Get duration for an asset. Reads kenburns.duration override from geo_timeline entry."""
     ext = os.path.splitext(asset_path)[1].lower()
     if ext in ['.mp4', '.mov', '.avi']:
         return get_media_duration(asset_path)
     duration = album_cfg["defaults"]["photo_duration"]
-    if asset_config and "kenburns" in asset_config and "duration" in asset_config["kenburns"]:
-        duration = asset_config["kenburns"]["duration"]
+    if t_data and t_data.get("kenburns") and t_data["kenburns"].get("duration"):
+        duration = t_data["kenburns"]["duration"]
     return float(duration)
+
 
 def get_zoompan_filter(duration_sec, fps, zoom, pan_direction, easing="linear"):
     total_frames = int(duration_sec * fps)
@@ -330,15 +374,24 @@ def get_zoompan_filter(duration_sec, fps, zoom, pan_direction, easing="linear"):
     y_expr = f"(ih-ih/{zoom})*({sy} + ({ey}-{sy})*on/{total_frames})"
     return f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={total_frames}:s=1920x1080:fps={fps}"
 
-def process_photo(asset_path, asset_config, album_cfg, temp_dir, idx):
+
+def process_photo(asset_path, t_data, album_cfg, temp_dir, idx):
+    """Process a photo with Ken Burns effect. Reads per-asset overrides from geo_timeline entry."""
     duration = album_cfg["defaults"]["photo_duration"]
-    if asset_config and "kenburns" in asset_config and "duration" in asset_config["kenburns"]:
-        duration = asset_config["kenburns"]["duration"]
+    if t_data and t_data.get("kenburns") and t_data["kenburns"].get("duration"):
+        duration = t_data["kenburns"]["duration"]
     
     kb_default = album_cfg["defaults"]["kenburns"]
     zoom = kb_default.get("zoom", 1.15)
     pan = kb_default.get("pan", "center-to-top")
     easing = kb_default.get("easing", "linear")
+    
+    # Per-asset kenburns overrides from geo_timeline
+    if t_data and t_data.get("kenburns"):
+        kb = t_data["kenburns"]
+        if kb.get("zoom"): zoom = kb["zoom"]
+        if kb.get("pan"): pan = kb["pan"]
+        if kb.get("easing"): easing = kb["easing"]
     
     fps = album_cfg["output"]["fps"]
     width, height = album_cfg["output"]["resolution"]
@@ -380,6 +433,7 @@ def process_photo(asset_path, asset_config, album_cfg, temp_dir, idx):
     run_ffmpeg(cmd, f"photo {os.path.basename(asset_path)}")
     return output_path
 
+
 def process_video(asset_path, album_cfg, temp_dir, idx):
     width, height = album_cfg["output"]["resolution"]
     fps = album_cfg["output"]["fps"]
@@ -401,6 +455,7 @@ def process_video(asset_path, album_cfg, temp_dir, idx):
     ]
     run_ffmpeg(cmd, f"video {os.path.basename(asset_path)}")
     return output_path
+
 
 def add_text_overlays(video_path, section_text, caption_text, resolution,
                       section_style, caption_style, output_path,
@@ -479,6 +534,7 @@ def add_text_overlays(video_path, section_text, caption_text, resolution,
     for tf in temp_files: os.unlink(tf)
     return output_path
 
+
 def build_audio_track_ffmpeg(music_files, total_duration, output_path, crossfade=2):
     if not music_files: return None
     loop_files = []
@@ -532,9 +588,219 @@ def build_audio_track_ffmpeg(music_files, total_duration, output_path, crossfade
     run_ffmpeg(cmd, "building audio track with crossfade")
     return output_path
 
+
+# ====================================================================
+# NEW: geo_timeline.yaml management
+# ====================================================================
+
+GEO_TIMELINE_HEADER = """# ====================================================================
+# geo_timeline.yaml — Unified per-asset timeline and configuration
+# Generated by Cinematic Hybrid Media Generator v{VERSION}
+# ====================================================================
+#
+# System-managed fields (auto-synced, do not edit):
+#   gps:             [latitude, longitude] from EXIF data
+#   location:        Reverse-geocoded address (auto-fetched, can be regenerated)
+#   location_correction: Manual location override (your edit; preserved by --clear-config)
+#   start_time:      Position in the video timeline (seconds, auto-calculated)
+#   duration:        Clip duration (seconds; auto from video, or from photo_duration)
+#
+# User-editable optional fields (add to any asset entry below):
+#   text:            Caption text displayed over the asset
+#   section:         Section/chapter title overlay
+#     title:         Section title (required if section is present)
+#     subtitle:      Section subtitle (optional)
+#   style:           Per-asset caption style override
+#     font_size:     Font size (e.g. 56)
+#     font_color:    Font color hex (e.g. "#FFD700")
+#     position:      "top", "bottom", or "center"
+#   kenburns:        Per-asset Ken Burns override
+#     zoom:          Final zoom factor (e.g. 1.25)
+#     pan:           Pan direction (e.g. "top-left-to-bottom-right")
+#     easing:        "linear", "ease-in", "ease-out", or "ease-in-out"
+#     duration:      Override photo duration for this asset (seconds)
+#
+# ====================================================================
+"""
+
+
+def new_timeline_entry():
+    """Return a fresh timeline entry with all fields (system + user) defaulted."""
+    return {
+        "gps": None,
+        "location": "",
+        "location_correction": "",
+        "start_time": 0.0,
+        "duration": 0.0,
+        "text": "",
+        "section": None,
+        "style": None,
+        "kenburns": None,
+    }
+
+
+def load_geo_timeline(project_dir):
+    """Load geo_timeline.yaml from project directory."""
+    timeline_path = os.path.join(project_dir, "geo_timeline.yaml")
+    if os.path.exists(timeline_path):
+        with open(timeline_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def save_geo_timeline(project_dir, geo_timeline, header=True):
+    """Save geo_timeline.yaml with optional header comment."""
+    timeline_path = os.path.join(project_dir, "geo_timeline.yaml")
+    with open(timeline_path, 'w', encoding='utf-8') as f:
+        if header:
+            f.write(GEO_TIMELINE_HEADER.format(VERSION=VERSION))
+        yaml.dump(geo_timeline, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+
+def collect_assets(project_dir):
+    """Discover all media assets in the project dir."""
+    raw_files = []
+    for ext in ['*.jpg', '*.jpeg', '*.png', '*.mp4', '*.mov', '*.avi']:
+        raw_files.extend(glob.glob(os.path.join(project_dir, ext)))
+        raw_files.extend(glob.glob(os.path.join(project_dir, ext.upper())))
+    return sorted([
+        f for f in set(raw_files)
+        if not os.path.basename(f).startswith("part_")
+        and "_MASTER" not in os.path.basename(f).upper()
+    ])
+
+
+# ====================================================================
+# --clear-config
+# ====================================================================
+
+def clear_timeline_config(project_dir):
+    """Clean geo_timeline.yaml:
+    1. Remove entries for missing photo/video files.
+    2. Clear all location fields (keep location_correction intact).
+    3. Remove legacy per-asset .yaml files.
+    """
+    timeline_path = os.path.join(project_dir, "geo_timeline.yaml")
+    if not os.path.exists(timeline_path):
+        log("No geo_timeline.yaml to clean.")
+        return
+
+    with open(timeline_path, 'r', encoding='utf-8') as f:
+        geo_timeline = yaml.safe_load(f) or {}
+
+    current_files = set()
+    for ap in collect_assets(project_dir):
+        current_files.add(os.path.basename(ap))
+
+    # 1. Remove stale entries
+    removed = [k for k in list(geo_timeline.keys()) if k not in current_files]
+    for k in removed:
+        del geo_timeline[k]
+    if removed:
+        log(f"Removed {len(removed)} stale timeline entries: {', '.join(removed[:5])}"
+            + ("..." if len(removed) > 5 else ""))
+    else:
+        log("No stale timeline entries to remove.")
+
+    # 2. Clear location fields, keep location_correction
+    cleared = 0
+    for k, v in geo_timeline.items():
+        if isinstance(v, dict) and v.get("location"):
+            v["location"] = ""
+            cleared += 1
+    if cleared:
+        log(f"Cleared location field in {cleared} entries (location_correction preserved).")
+
+    # 3. Remove legacy per-asset .yaml files
+    per_asset_yamls = []
+    for yp in glob.glob(os.path.join(project_dir, "*.yaml")):
+        bn = os.path.basename(yp)
+        if bn not in ("album_config.yaml", "geo_timeline.yaml"):
+            per_asset_yamls.append(yp)
+    for yp in per_asset_yamls:
+        os.remove(yp)
+        log(f"Removed legacy per-asset config: {os.path.basename(yp)}")
+
+    # Also remove .caption files if any
+    for cp in glob.glob(os.path.join(project_dir, "*.caption")):
+        os.remove(cp)
+        log(f"Removed legacy .caption file: {os.path.basename(cp)}")
+
+    save_geo_timeline(project_dir, geo_timeline)
+    log("✅ geo_timeline.yaml cleaned.")
+
+
+# ====================================================================
+# --migrate  (one-shot: per-asset .yaml → geo_timeline.yaml)
+# ====================================================================
+
+def migrate_per_asset_configs(project_dir):
+    """Migrate legacy per-asset .yaml content into geo_timeline.yaml."""
+    timeline_path = os.path.join(project_dir, "geo_timeline.yaml")
+    geo_timeline = load_geo_timeline(project_dir)
+
+    migrated = 0
+    for yaml_path in sorted(glob.glob(os.path.join(project_dir, "*.yaml"))):
+        basename = os.path.basename(yaml_path)
+        if basename in ("album_config.yaml", "geo_timeline.yaml"):
+            continue
+
+        # Per-asset yaml is named `<asset_filename>.yaml`
+        # e.g. PXL_20260428_070658831.MP.yaml → asset filename: PXL_20260428_070658831.MP
+        # The actual asset on disk is PXL_20260428_070658831.MP.jpg
+        asset_filename = os.path.splitext(basename)[0]
+
+        if asset_filename not in geo_timeline:
+            # Try to find it — the entry may be stored under the full filename with extension
+            found = False
+            for key in geo_timeline:
+                if key.startswith(asset_filename):
+                    asset_filename = key
+                    found = True
+                    break
+            if not found:
+                log(f"   ⚠️ {asset_filename} not in geo_timeline, skipping {basename}")
+                continue
+
+        with open(yaml_path, 'r') as f:
+            content = yaml.safe_load(f) or {}
+
+        if not content:
+            log(f"   ⏭️  Empty config: {basename}")
+            continue
+
+        t_data = geo_timeline[asset_filename]
+        for key in ("text", "section", "style", "kenburns"):
+            if key in content and content[key] is not None:
+                t_data[key] = content[key]
+
+        log(f"   ✅ Migrated {basename} → geo_timeline[{asset_filename}]")
+        migrated += 1
+
+    if migrated:
+        save_geo_timeline(project_dir, geo_timeline)
+        log(f"✅ Migrated {migrated} per-asset configs into geo_timeline.yaml")
+        log("   Run --clear-config to remove the legacy .yaml files, or delete them manually.")
+    else:
+        log("No per-asset configs found to migrate.")
+
+
+# ====================================================================
+# MAIN
+# ====================================================================
+
 def main():
     init_mode = "--init" in sys.argv
     if init_mode: sys.argv.remove("--init")
+
+    clear_config_mode = "--clear-config" in sys.argv
+    if clear_config_mode: sys.argv.remove("--clear-config")
+
+    migrate_mode = "--migrate" in sys.argv
+    if migrate_mode: sys.argv.remove("--migrate")
+
+    location_only_mode = "--location-only" in sys.argv
+    if location_only_mode: sys.argv.remove("--location-only")
 
     add_audio_mode = "--add-audio" in sys.argv
     audio_target_video = None
@@ -544,9 +810,25 @@ def main():
         sys.argv.pop(pos)
         sys.argv.pop(pos)
 
+    help_mode = "--help" in sys.argv or "-h" in sys.argv
+
     print_version()
-    if len(sys.argv) < 2:
-        print("Usage: make_video_album.py <project_name> [start] [end] [--chunk-size N] [--init] [--add-audio <video>]")
+
+    if len(sys.argv) < 2 or help_mode:
+        print("Usage: make_video_album.py <project_name> [start] [end] [options]")
+        print("")
+        print("Options:")
+        print("  --init              Generate config files and exit (no rendering)")
+        print("  --clear-config      Clean geo_timeline.yaml (remove stale, clear locations, remove legacy)")
+        print("  --migrate           Migrate legacy per-asset .yaml files into geo_timeline.yaml (no rendering)")
+        print("  --location-only     Query server to fill all empty location fields, then exit (no rendering)")
+        print("  --add-audio <video> Audio muxing mode: build looped track and mux into video")
+        print("  --chunk-size N      Number of assets per chunk (default: 200)")
+        print("")
+        print("Examples:")
+        print("  make_video_album.py park_pottery --init")
+        print("  make_video_album.py park_pottery --clear-config")
+        print("  make_video_album.py park_pottery --migrate")
         sys.exit(1)
 
     project_name = sys.argv[1]
@@ -554,6 +836,71 @@ def main():
     if not os.path.isdir(project_dir):
         print(f"❌ Project directory {project_dir} not found")
         sys.exit(1)
+
+    # --- Handle --clear-config (standalone) ---
+    if clear_config_mode:
+        log("--- CLEANING CONFIG ---")
+        clear_timeline_config(project_dir)
+        sys.exit(0)
+
+    # --- Handle --migrate (standalone) ---
+    if migrate_mode:
+        log("--- MIGRATING PER-ASSET CONFIGS ---")
+        migrate_per_asset_configs(project_dir)
+        sys.exit(0)
+
+    # --- Handle --location-only (standalone) ---
+    if location_only_mode:
+        log("--- LOCATION RESOLUTION ONLY ---")
+        album_cfg = load_album_config(project_dir)
+        all_assets = collect_assets(project_dir)
+        log(f"Found {len(all_assets)} assets.")
+        geo_timeline = load_geo_timeline(project_dir)
+        reuse_distance = album_cfg.get("geo", {}).get("location_reuse_distance", 15.0)
+
+        # Sync timeline: extract GPS, add new entries
+        timeline_updated = False
+        for asset_path in all_assets:
+            filename = os.path.basename(asset_path)
+            ext = os.path.splitext(asset_path)[1].lower()
+            if filename not in geo_timeline:
+                geo_timeline[filename] = new_timeline_entry()
+                timeline_updated = True
+            t_data = geo_timeline[filename]
+            if t_data.get("gps") is None and ext in ['.jpg', '.jpeg', '.png']:
+                exif = get_exif_data(asset_path)
+                if exif and 'GPSInfo' in exif:
+                    coords = get_decimal_coordinates(exif['GPSInfo'])
+                    if coords:
+                        t_data["gps"] = list(coords)
+                        timeline_updated = True
+
+        # Resolve locations eagerly
+        resolved, reused, skipped = 0, 0, 0
+        for filename, t_data in geo_timeline.items():
+            if t_data.get("location") or t_data.get("location_correction"):
+                skipped += 1
+                continue
+            if not t_data.get("gps"):
+                continue
+            lat, lon = t_data["gps"]
+            nearby_loc = find_nearby_location(geo_timeline, lat, lon, reuse_distance, exclude_filename=filename)
+            if nearby_loc:
+                t_data["location"] = nearby_loc
+                reused += 1
+                log(f"   📍 Reused (≤{reuse_distance:.0f}m): {filename} → {nearby_loc[:70]}...")
+            else:
+                loc = get_location_nominatim(lat, lon)
+                if loc:
+                    t_data["location"] = loc
+                    resolved += 1
+                    log(f"   📍 Fetched: {filename} → {loc[:70]}...")
+                else:
+                    log(f"   ⚠️  Fetch failed: {filename} ({lat:.4f}, {lon:.4f})")
+
+        save_geo_timeline(project_dir, geo_timeline)
+        log(f"✅ Resolved {resolved} new locations, reused {reused} nearby, {skipped} already cached.")
+        sys.exit(0)
 
     album_cfg = load_album_config(project_dir, init_mode=init_mode)
 
@@ -594,24 +941,12 @@ def main():
     start_idx = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     end_idx = int(sys.argv[3]) if len(sys.argv) > 3 else 999999
 
-    raw_files = []
-    for ext in ['*.jpg', '*.jpeg', '*.png', '*.mp4', '*.mov', '*.avi']:
-        raw_files.extend(glob.glob(os.path.join(project_dir, ext)))
-        raw_files.extend(glob.glob(os.path.join(project_dir, ext.upper())))
-        
-    all_assets = sorted([
-        f for f in set(raw_files)
-        if not os.path.basename(f).startswith("part_")
-        and "_MASTER" not in os.path.basename(f).upper()
-    ])
+    all_assets = collect_assets(project_dir)
     log(f"Found {len(all_assets)} total assets.")
 
-    # Timeline Sync
+    # Load or create geo_timeline
     timeline_path = os.path.join(project_dir, "geo_timeline.yaml")
-    geo_timeline = {}
-    if os.path.exists(timeline_path):
-        with open(timeline_path, 'r', encoding='utf-8') as f:
-            geo_timeline = yaml.safe_load(f) or {}
+    geo_timeline = load_geo_timeline(project_dir)
 
     log("Syncing global timeline (geo_timeline.yaml)...")
     current_time_tracker = 0.0
@@ -621,8 +956,9 @@ def main():
         filename = os.path.basename(asset_path)
         ext = os.path.splitext(asset_path)[1].lower()
         
+        # New entry: full schema with user-editable fields defaulted
         if filename not in geo_timeline:
-            geo_timeline[filename] = {"gps": None, "location": "", "location_correction": "", "start_time": 0.0, "duration": 0.0}
+            geo_timeline[filename] = new_timeline_entry()
             timeline_updated = True
             
         t_data = geo_timeline[filename]
@@ -638,7 +974,7 @@ def main():
                 t_data["duration"] = get_media_duration(asset_path)
                 timeline_updated = True
         else:
-            new_dur = get_asset_duration(asset_path, album_cfg, load_asset_config(asset_path))
+            new_dur = get_asset_duration(asset_path, album_cfg, t_data)
             if t_data.get("duration") != new_dur:
                 t_data["duration"] = new_dur
                 timeline_updated = True
@@ -654,12 +990,36 @@ def main():
 
         current_time_tracker += t_data["duration"]
 
+    # Save timeline if anything changed
     if timeline_updated:
-        with open(timeline_path, 'w', encoding='utf-8') as f:
-            yaml.dump(geo_timeline, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        save_geo_timeline(project_dir, geo_timeline)
+        log("Timeline updated and saved.")
 
     if init_mode:
+        # --- In init mode, add template fields to first photo asset ---
+        first_photo_filename = None
+        for ap in all_assets:
+            if os.path.splitext(ap)[1].lower() in ['.jpg', '.jpeg', '.png']:
+                first_photo_filename = os.path.basename(ap)
+                break
+        if first_photo_filename and first_photo_filename in geo_timeline:
+            t = geo_timeline[first_photo_filename]
+            # Only add template fields if they don't already have values
+            if t.get("text") is None:
+                t["text"] = ""
+            if t.get("section") is None:
+                t["section"] = None
+            if t.get("style") is None:
+                t["style"] = None
+            if t.get("kenburns") is None:
+                t["kenburns"] = None
+            log(f"Added per-asset template fields to: {first_photo_filename}")
+
+        # Always re-save with header in init mode (even if no content changes)
+        save_geo_timeline(project_dir, geo_timeline)
         log("Initialisation complete. Exiting.")
+        log(f"Per-asset fields are documented in {timeline_path}")
+        log("Edit geo_timeline.yaml to add text, section, style, or kenburns per-asset overrides.")
         sys.exit(0)
 
     # ----------------------------------------------------------------
@@ -690,34 +1050,51 @@ def main():
             log(f"   Location (Cached): {location_text}")
         elif t_data.get("gps"):
             lat, lon = t_data["gps"]
-            loc = get_location_nominatim(lat, lon)
-            if loc:
-                t_data["location"] = loc
-                location_text = loc
-                log(f"   Location (Fetched): {location_text}")
-                # Save dynamically so we don't lose data if it crashes
-                with open(timeline_path, 'w', encoding='utf-8') as f:
-                    yaml.dump(geo_timeline, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            nearby_distance = album_cfg.get("geo", {}).get("location_reuse_distance", 15.0)
+            # Check if another asset within threshold already has a cached location
+            nearby_loc = find_nearby_location(geo_timeline, lat, lon, nearby_distance, exclude_filename=filename)
+            if nearby_loc:
+                t_data["location"] = nearby_loc
+                geo_timeline[filename] = t_data
+                location_text = nearby_loc
+                log(f"   Location (Nearby, ≤{nearby_distance:.0f}m): {location_text}")
             else:
-                log(f"   Location (Fetch Failed): GPS {lat:.4f}, {lon:.4f}")
+                loc = get_location_nominatim(lat, lon)
+                if loc:
+                    t_data["location"] = loc
+                    geo_timeline[filename] = t_data
+                    location_text = loc
+                    log(f"   Location (Fetched): {location_text}")
+                    # Save dynamically so we don't lose data if it crashes
+                    save_geo_timeline(project_dir, geo_timeline)
+                else:
+                    log(f"   Location (Fetch Failed): GPS {lat:.4f}, {lon:.4f}")
 
-        asset_config = load_asset_config(asset_path)
         ext = os.path.splitext(asset_path)[1].lower()
         
+        # Per-asset overrides from unified geo_timeline entry
         section_text = None
-        caption_text = asset_config.get("text") if asset_config else None
+        caption_text = t_data.get("text") if t_data.get("text") else None
         photo_filename = filename if (show_photo_filenames and ext in ['.jpg', '.jpeg', '.png']) else None
 
-        if asset_config and "section" in asset_config:
-            title = asset_config["section"].get("title", "")
-            subtitle = asset_config["section"].get("subtitle", "")
-            if title: section_text = title + ("\n" + subtitle if subtitle else "")
+        if t_data.get("section"):
+            sec = t_data["section"]
+            title = sec.get("title", "")
+            subtitle = sec.get("subtitle", "")
+            if title:
+                section_text = title + (f"\n{subtitle}" if subtitle else "")
 
+        # Style overrides from geo_timeline entry
         sec_style = default_section_style.copy()
         cap_style = default_caption_style.copy()
+        if t_data.get("style"):
+            us = t_data["style"]
+            if us.get("font_size"): cap_style["font_size"] = us["font_size"]
+            if us.get("font_color"): cap_style["font_color"] = us["font_color"]
+            if us.get("position"): cap_style["position"] = us["position"]
         
         if ext in ['.jpg', '.jpeg', '.png']:
-            seg_path = process_photo(asset_path, asset_config, album_cfg, temp_dir, idx)
+            seg_path = process_photo(asset_path, t_data, album_cfg, temp_dir, idx)
         else:
             seg_path = process_video(asset_path, album_cfg, temp_dir, idx)
         
@@ -754,6 +1131,7 @@ def main():
     elapsed = time.time() - start_time
     log(f"✅ Done: {part_output} (Silent Video Chunk)")
     log(f"⏱️ Total processing time: {elapsed:.1f} seconds")
+
 
 if __name__ == "__main__":
     main()
