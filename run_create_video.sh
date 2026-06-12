@@ -19,8 +19,11 @@
 #  To LLM：Please keep all valid comments and other information when updating!!! (please keep this line.)
 
 # current version:
-VERSION="4.5"
-VERSION_DATE="2026-06-10"
+VERSION="4.6"
+VERSION_DATE="2026-06-11"
+# v4.6  2026-06-11  Detailed TIMING REPORT at end of run.
+#                   Concat and audio steps wrapped in bash timers.
+#                   Python emits Location resolution time + Chunk rendering time.
 
 # ====================================================================
 # 1. Special case: internal logger (called by xterm)
@@ -313,14 +316,20 @@ done
 
 if [ -s "inputs.txt" ]; then
     # Stitch video parts together (silent)
+    concat_start=$(date +%s)
     ffmpeg -f concat -safe 0 -i inputs.txt -c copy "$FINAL_OUT" >> "$RENDER_LOG" 2>&1
+    concat_end=$(date +%s)
+    CONCAT_SEC=$((concat_end - concat_start))
     echo "✅ SUCCESS: Video parts stitched (Silent)." | tee -a "$RENDER_LOG"
     
     # Run the Python script in audio-only mode on the final stitched master
+    audio_start=$(date +%s)
     echo "🦞 Generating continuous audio track and muxing into final master..." | tee -a "$RENDER_LOG"
     source "$VENV_PATH"
     python3 "$PY_SCRIPT" "$PROJECT" --add-audio "$FINAL_OUT" 2>&1 | tee -a "$RENDER_LOG"
     deactivate
+    audio_end=$(date +%s)
+    AUDIO_SEC=$((audio_end - audio_start))
     
     echo "✅ SUCCESS: $PROJECT Final Master Created with Audio!" | tee -a "$RENDER_LOG"
 else
@@ -331,48 +340,62 @@ fi
 kill $LOGGER_PID 2>/dev/null
 
 # ====================================================================
-# 11. Print total execution time (stitching only)
+# 11. Timing report (detailed breakdown)
 # ====================================================================
-end_time=$(date +%s)
-elapsed=$((end_time - start_time))
-hours=$((elapsed / 3600))
-minutes=$(((elapsed % 3600) / 60))
-seconds=$((elapsed % 60))
 
-# Get actual video duration from final master
+# Aggregate location resolution time from Python logs
+LOCATION_SEC=0
+RENDER_SEC=0
+if command -v bc &>/dev/null; then
+    while IFS= read -r line; do
+        if [[ $line =~ Location\ resolution\ time:\ ([0-9.]+)\ seconds ]]; then
+            LOCATION_SEC=$(echo "$LOCATION_SEC + ${BASH_REMATCH[1]}" | bc)
+        fi
+        if [[ $line =~ Chunk\ rendering\ time:\ ([0-9.]+)\ seconds ]]; then
+            RENDER_SEC=$(echo "$RENDER_SEC + ${BASH_REMATCH[1]}" | bc)
+        fi
+    done < "$RENDER_LOG"
+fi
+
+# Wall-clock total since first python call
+total_wall_end=$(date +%s)
+TOTAL_WALL=$((total_wall_end - start_time))
+
+# Format helper (prints Xh Ym Zs)
+fmt_time() {
+    local s=$1
+    local h=$((s / 3600))
+    local m=$(((s % 3600) / 60))
+    local sec=$((s % 60))
+    if [ "$h" -gt 0 ]; then echo "${h}h ${m}m ${sec}s"
+    elif [ "$m" -gt 0 ]; then echo "${m}m ${sec}s"
+    else echo "${sec}s"
+    fi
+}
+
+SUM_ALL=$(( $(echo "$LOCATION_SEC + $RENDER_SEC + ${CONCAT_SEC:-0} + ${AUDIO_SEC:-0}" | bc 2>/dev/null | cut -d. -f1) ))
+
+# Print timing report (plain rows, easy to copy-paste)
+echo "" | tee -a "$RENDER_LOG"
+echo "📊 TIMING REPORT" | tee -a "$RENDER_LOG"
+echo "Location fetching  : $(fmt_time "$(echo "$LOCATION_SEC/1" | bc 2>/dev/null || echo 0)") ($(printf "%.0f" "$LOCATION_SEC")s)" | tee -a "$RENDER_LOG"
+echo "Rendering          : $(fmt_time "$(echo "$RENDER_SEC/1" | bc 2>/dev/null || echo 0)") ($(printf "%.0f" "$RENDER_SEC")s)" | tee -a "$RENDER_LOG"
+echo "Concatenation      : $(fmt_time "${CONCAT_SEC:-0}") (${CONCAT_SEC:-0}s)" | tee -a "$RENDER_LOG"
+echo "Audio mixing       : $(fmt_time "${AUDIO_SEC:-0}") (${AUDIO_SEC:-0}s)" | tee -a "$RENDER_LOG"
+echo "Sum of components  : $(fmt_time "$SUM_ALL") ($SUM_ALL s)" | tee -a "$RENDER_LOG"
+echo "Wall-clock total   : $(fmt_time "$TOTAL_WALL") ($TOTAL_WALL s)" | tee -a "$RENDER_LOG"
+echo "Gap (overhead)     : $(fmt_time "$((TOTAL_WALL - SUM_ALL))") ($((TOTAL_WALL - SUM_ALL)) s) — Logger, ffprobe, file I/O, script glue" | tee -a "$RENDER_LOG"
+
+# Video metadata
+echo "" | tee -a "$RENDER_LOG"
+echo "$TOTAL_ASSETS genuine assets." | tee -a "$RENDER_LOG"
 if [ -f "$FINAL_OUT" ]; then
     VIDEO_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FINAL_OUT")
     if [ -n "$VIDEO_DUR" ]; then
-        dur_sec=$(printf "%.0f" "$VIDEO_DUR")
-        dur_h=$((dur_sec / 3600))
-        dur_m=$(((dur_sec % 3600) / 60))
-        dur_s=$((dur_sec % 60))
-        echo "Video duration: ${dur_h}h ${dur_m}m ${dur_s}s" | tee -a "$RENDER_LOG"
+        echo "Video duration: $(fmt_time "$(printf "%.0f" "$VIDEO_DUR")")" | tee -a "$RENDER_LOG"
     fi
-else
-    echo "Final master not found." | tee -a "$RENDER_LOG"
 fi
-
-# Sum total rendering time from Python logs
-if command -v bc &>/dev/null; then
-    TOTAL_RENDER_SEC=0
-    while IFS= read -r line; do
-        if [[ $line =~ Total\ processing\ time:\ ([0-9.]+)\ seconds ]]; then
-            TOTAL_RENDER_SEC=$(echo "$TOTAL_RENDER_SEC + ${BASH_REMATCH[1]}" | bc)
-        fi
-    done < "$RENDER_LOG"
-    if (( $(echo "$TOTAL_RENDER_SEC > 0" | bc -l) )); then
-        render_hours=$(echo "$TOTAL_RENDER_SEC / 3600" | bc)
-        render_minutes=$(echo "($TOTAL_RENDER_SEC % 3600) / 60" | bc)
-        render_seconds=$(echo "$TOTAL_RENDER_SEC % 60" | bc)
-        echo "Total rendering time: ${render_hours}h ${render_minutes}m ${render_seconds}s" | tee -a "$RENDER_LOG"
-    fi
-else
-    echo "Install bc to see cumulative rendering time: sudo apt install bc" | tee -a "$RENDER_LOG"
-fi
-
-echo "$TOTAL_ASSETS genuine assets." | tee -a "$RENDER_LOG"
-echo "$FINAL_OUT -  codec name, and duration obtained by ffprobe:" 
+echo "$FINAL_OUT - codec name, and duration obtained by ffprobe:" 
 ffprobe -v error -show_entries stream=codec_name:format=duration,size -of default=noprint_wrappers=1 "$FINAL_OUT"| awk -F= '
 /codec_name/ {codecs = codecs (codecs ? ", " : "") $2}
 /duration/ {dur = $2}

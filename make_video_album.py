@@ -94,8 +94,10 @@ try:
 except ImportError:
     Nominatim = None
 
-VERSION = "42.2"
-VERSION_DATE = "2026-06-10"
+VERSION = "42.3"
+VERSION_DATE = "2026-06-11"
+# v42.3  2026-06-11  Auto pre-resolve: batch all location lookups before chunk rendering
+#                    to avoid per-asset Nominatim calls interleaved with FFmpeg. (#453)
 ENGINE = "Pure FFmpeg (zoompan + drawtext + boxblur)"
 DEFAULT_CHUNK_SIZE = 200
 WRAP_LENGTH = 50
@@ -1023,6 +1025,34 @@ def main():
         sys.exit(0)
 
     # ----------------------------------------------------------------
+    # PRE-RESOLVE: Batch location resolution (avoids per-asset API calls mid-render)
+    # ----------------------------------------------------------------
+    loc_start = time.time()
+    reuse_distance = album_cfg.get("geo", {}).get("location_reuse_distance", 15.0)
+    pending = [(fn, t) for fn, t in geo_timeline.items()
+               if not t.get("location") and not t.get("location_correction") and t.get("gps")]
+    if pending:
+        log(f"📡 Pre-resolving {len(pending)} unresolved locations (batch)...")
+        resolved, reused = 0, 0
+        for fn, t_data in pending:
+            lat, lon = t_data["gps"]
+            nearby = find_nearby_location(geo_timeline, lat, lon, reuse_distance, exclude_filename=fn)
+            if nearby:
+                t_data["location"] = nearby
+                reused += 1
+            else:
+                loc = get_location_nominatim(lat, lon)
+                if loc:
+                    t_data["location"] = loc
+                    resolved += 1
+                else:
+                    log(f"   ⚠️  Fetch failed: {fn} ({lat:.4f}, {lon:.4f})")
+        save_geo_timeline(project_dir, geo_timeline)
+        log(f"✅ Pre-resolved: {resolved} new, {reused} reused")
+    loc_elapsed = time.time() - loc_start
+    log(f"⏱️ Location resolution time: {loc_elapsed:.1f} seconds")
+
+    # ----------------------------------------------------------------
     # CHUNK PROCESSING
     # ----------------------------------------------------------------
     chunk_assets = all_assets[start_idx:end_idx]
@@ -1128,9 +1158,9 @@ def main():
     run_ffmpeg(cmd_concat, "concatenating segments")
     
     shutil.rmtree(temp_dir, ignore_errors=True)
-    elapsed = time.time() - start_time
+    render_elapsed = time.time() - start_time
     log(f"✅ Done: {part_output} (Silent Video Chunk)")
-    log(f"⏱️ Total processing time: {elapsed:.1f} seconds")
+    log(f"⏱️ Chunk rendering time: {render_elapsed:.1f} seconds")
 
 
 if __name__ == "__main__":
