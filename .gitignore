@@ -9,3 +9,7 @@ __pycache__/
 # Local release notes (kept locally, not version controlled)
 release_notes/
 CLAUDE.md
+
+# Tracked only in local git (not pushed to GitHub)
+photo_geo.py
+run_photo_geo.sh
